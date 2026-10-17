@@ -1,0 +1,80 @@
+name: Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+concurrency:
+  group: shrink-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-26
+    timeout-minutes: 80
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select newest stable Xcode
+        run: |
+          STABLE=$(ls -d /Applications/Xcode*.app | grep -viE "beta|release_candidate|_rc" | sort -V | tail -n1)
+          sudo xcode-select -s "$STABLE/Contents/Developer"
+          xcodebuild -version
+      - run: brew install xcodegen && xcodegen generate
+      - name: Pick simulator
+        id: sim
+        run: |
+          UDID=$(xcrun simctl list devices available -j | python3 -c "import json,sys;d=json.load(sys.stdin)['devices'];print(next((x['udid'] for v in d.values() for x in v if x['name'].startswith('iPhone 17 Pro')),''))")
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+      - name: Unit and end-to-end tests
+        run: |
+          set -o pipefail
+          xcodebuild test -project Shrink.xcodeproj -scheme Shrink -destination "id=${{ steps.sim.outputs.udid }}" \
+            -derivedDataPath "$RUNNER_TEMP/DD" -resultBundlePath "$RUNNER_TEMP/tests.xcresult" CODE_SIGNING_ALLOWED=NO \
+            | tee "$RUNNER_TEMP/test.log" | grep -E "E2E|error:|Test Case.*(passed|failed|skipped)|Executed|TEST (SUCCEEDED|FAILED)" || true
+          grep -q "TEST SUCCEEDED" "$RUNNER_TEMP/test.log"
+      - name: Keep test log
+        if: always()
+        run: cp "$RUNNER_TEMP/test.log" test.log || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-log
+          path: test.log
+          retention-days: 14
+
+  build:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select newest stable Xcode
+        run: |
+          STABLE=$(ls -d /Applications/Xcode*.app | grep -viE "beta|release_candidate|_rc" | sort -V | tail -n1)
+          sudo xcode-select -s "$STABLE/Contents/Developer"
+      - run: brew install xcodegen && xcodegen generate
+      - name: Build Release
+        run: |
+          set -o pipefail
+          xcodebuild -project Shrink.xcodeproj -scheme Shrink -configuration Release \
+            -destination "generic/platform=iOS" -derivedDataPath "$RUNNER_TEMP/DD" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" DEVELOPMENT_TEAM="" \
+            build | tee "$RUNNER_TEMP/build.log" | grep -E "error:|BUILD (SUCCEEDED|FAILED)" || true
+          grep -q "BUILD SUCCEEDED" "$RUNNER_TEMP/build.log"
+      - name: Package IPA
+        run: |
+          APP=$(find "$RUNNER_TEMP/DD/Build/Products" -maxdepth 2 -type d -name "*.app" | head -n1)
+          [ -n "$APP" ] || { echo "no .app built"; exit 1; }
+          mkdir Payload && cp -R "$APP" Payload/
+          EXE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "Payload/$(basename "$APP")/Info.plist")
+          cp -p "Payload/$(basename "$APP")/$EXE" "Payload/$(basename "$APP")/${EXE}_LiveContainerPatchBackUp"
+          zip -qry Shrink.ipa Payload
+          ls -la Shrink.ipa
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Shrink-ipa
+          path: Shrink.ipa
+          retention-days: 14
